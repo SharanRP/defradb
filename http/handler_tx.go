@@ -11,15 +11,20 @@
 package http
 
 import (
+	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/getkin/kin-openapi/openapi3"
 	"github.com/go-chi/chi/v5"
+
+	acpIdentity "github.com/sourcenetwork/defradb/acp/identity"
 )
 
 type txHandler struct{}
 
+// CreateTxResponse contains the transaction ID returned to the client.
 type CreateTxResponse struct {
 	ID uint64 `json:"id"`
 }
@@ -34,7 +39,19 @@ func (h *txHandler) NewTxn(rw http.ResponseWriter, req *http.Request) {
 		responseJSON(rw, http.StatusBadRequest, errorResponse{err})
 		return
 	}
-	txs.Store(tx.ID(), tx)
+
+	// Create storage key based on identity for isolation
+	var storageKey string
+	identity := acpIdentity.FromContext(req.Context())
+	if identity.HasValue() {
+		// Authenticated user: scope by DID
+		storageKey = fmt.Sprintf("%s:%d", identity.Value().DID(), tx.ID())
+	} else {
+		// Anonymous user: use numeric ID directly (HTTPS recommended for security)
+		storageKey = fmt.Sprintf("%d", tx.ID())
+	}
+
+	txs.Store(storageKey, tx)
 	responseJSON(rw, http.StatusOK, &CreateTxResponse{tx.ID()})
 }
 
@@ -48,7 +65,19 @@ func (h *txHandler) NewConcurrentTxn(rw http.ResponseWriter, req *http.Request) 
 		responseJSON(rw, http.StatusBadRequest, errorResponse{err})
 		return
 	}
-	txs.Store(tx.ID(), tx)
+
+	// Create storage key based on identity for isolation
+	var storageKey string
+	identity := acpIdentity.FromContext(req.Context())
+	if identity.HasValue() {
+		// Authenticated user: scope by DID
+		storageKey = fmt.Sprintf("%s:%d", identity.Value().DID(), tx.ID())
+	} else {
+		// Anonymous user: use numeric ID directly (HTTPS recommended for security)
+		storageKey = fmt.Sprintf("%d", tx.ID())
+	}
+
+	txs.Store(storageKey, tx)
 	responseJSON(rw, http.StatusOK, &CreateTxResponse{tx.ID()})
 }
 
@@ -60,7 +89,32 @@ func (h *txHandler) Commit(rw http.ResponseWriter, req *http.Request) {
 		responseJSON(rw, http.StatusBadRequest, errorResponse{ErrInvalidTransactionId})
 		return
 	}
-	txVal, ok := txs.Load(txID)
+	txIDStr := strconv.FormatUint(txID, 10)
+
+	// Determine storage key and verify signature based on identity
+	var storageKey string
+	identity := acpIdentity.FromContext(req.Context())
+	if identity.HasValue() {
+		// Authenticated user: verify signature before allowing commit
+		signature := req.Header.Get(txSignatureHeaderName)
+		err := VerifyTxSignature(
+			identity.Value().PublicKey(),
+			signature,
+			"commit",
+			txIDStr,
+			strings.ToLower(req.Host),
+		)
+		if err != nil {
+			responseJSON(rw, http.StatusForbidden, errorResponse{err})
+			return
+		}
+		storageKey = fmt.Sprintf("%s:%d", identity.Value().DID(), txID)
+	} else {
+		// Anonymous user: direct lookup (HTTPS recommended for security)
+		storageKey = txIDStr
+	}
+
+	txVal, ok := txs.Load(storageKey)
 	if !ok {
 		responseJSON(rw, http.StatusBadRequest, errorResponse{ErrInvalidTransactionId})
 		return
@@ -72,7 +126,7 @@ func (h *txHandler) Commit(rw http.ResponseWriter, req *http.Request) {
 		responseJSON(rw, http.StatusBadRequest, errorResponse{err})
 		return
 	}
-	txs.Delete(txID)
+	txs.Delete(storageKey)
 	rw.WriteHeader(http.StatusOK)
 }
 
@@ -84,7 +138,32 @@ func (h *txHandler) Discard(rw http.ResponseWriter, req *http.Request) {
 		responseJSON(rw, http.StatusBadRequest, errorResponse{ErrInvalidTransactionId})
 		return
 	}
-	txVal, ok := txs.LoadAndDelete(txID)
+	txIDStr := strconv.FormatUint(txID, 10)
+
+	// Determine storage key and verify signature based on identity
+	var storageKey string
+	identity := acpIdentity.FromContext(req.Context())
+	if identity.HasValue() {
+		// Authenticated user: verify signature before allowing discard
+		signature := req.Header.Get(txSignatureHeaderName)
+		err := VerifyTxSignature(
+			identity.Value().PublicKey(),
+			signature,
+			"discard",
+			txIDStr,
+			strings.ToLower(req.Host),
+		)
+		if err != nil {
+			responseJSON(rw, http.StatusForbidden, errorResponse{err})
+			return
+		}
+		storageKey = fmt.Sprintf("%s:%d", identity.Value().DID(), txID)
+	} else {
+		// Anonymous user: direct lookup (HTTPS recommended for security)
+		storageKey = txIDStr
+	}
+
+	txVal, ok := txs.LoadAndDelete(storageKey)
 	if !ok {
 		responseJSON(rw, http.StatusBadRequest, errorResponse{ErrInvalidTransactionId})
 		return

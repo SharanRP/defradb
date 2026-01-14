@@ -22,6 +22,7 @@ import (
 	"github.com/go-chi/cors"
 	"golang.org/x/exp/slices"
 
+	acpIdentity "github.com/sourcenetwork/defradb/acp/identity"
 	"github.com/sourcenetwork/defradb/client"
 	"github.com/sourcenetwork/defradb/errors"
 	"github.com/sourcenetwork/defradb/internal/db"
@@ -37,17 +38,17 @@ func CorsMiddleware(allowedOrigins []string) func(http.Handler) http.Handler {
 			return slices.Contains(allowedOrigins, strings.ToLower(origin))
 		},
 		AllowedMethods: []string{"GET", "HEAD", "POST", "PATCH", "DELETE"},
-		AllowedHeaders: []string{"Content-Type", "Authorization"},
+		AllowedHeaders: []string{"Content-Type", "Authorization", txSignatureHeaderName},
 		MaxAge:         300,
 	})
 }
 
 // ApiMiddleware sets the required context values for all API requests.
-func ApiMiddleware(db client.TxnStore, txs *sync.Map) func(http.Handler) http.Handler {
+func ApiMiddleware(database client.TxnStore, txs *sync.Map) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
 			ctx := req.Context()
-			ctx = context.WithValue(ctx, dbContextKey, db)
+			ctx = context.WithValue(ctx, dbContextKey, database)
 			ctx = context.WithValue(ctx, txsContextKey, txs)
 			next.ServeHTTP(rw, req.WithContext(ctx))
 		})
@@ -55,6 +56,8 @@ func ApiMiddleware(db client.TxnStore, txs *sync.Map) func(http.Handler) http.Ha
 }
 
 // TransactionMiddleware sets the transaction context for the current request.
+// It looks up the transaction using identity-scoped keys for authenticated users
+// and direct ID lookup for anonymous users.
 func TransactionMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
 		txs := mustGetContextSyncMap(req)
@@ -64,12 +67,25 @@ func TransactionMiddleware(next http.Handler) http.Handler {
 			next.ServeHTTP(rw, req)
 			return
 		}
-		id, err := strconv.ParseUint(txValue, 10, 64)
+
+		txID, err := strconv.ParseUint(txValue, 10, 64)
 		if err != nil {
 			next.ServeHTTP(rw, req)
 			return
 		}
-		tx, ok := txs.Load(id)
+
+		// Determine the storage key based on user identity
+		var storageKey string
+		identity := acpIdentity.FromContext(req.Context())
+		if identity.HasValue() {
+			// Authenticated user: construct DID-scoped key
+			storageKey = fmt.Sprintf("%s:%d", identity.Value().DID(), txID)
+		} else {
+			// Anonymous user: use numeric ID directly
+			storageKey = fmt.Sprintf("%d", txID)
+		}
+
+		tx, ok := txs.Load(storageKey)
 		if !ok {
 			next.ServeHTTP(rw, req)
 			return
@@ -85,9 +101,9 @@ func TransactionMiddleware(next http.Handler) http.Handler {
 // CollectionMiddleware sets the collection context for the current request.
 func CollectionMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
-		db := mustGetContextClientDB(req)
+		database := mustGetContextClientDB(req)
 
-		col, err := db.GetCollectionByName(req.Context(), chi.URLParam(req, "name"))
+		col, err := database.GetCollectionByName(req.Context(), chi.URLParam(req, "name"))
 		if err != nil {
 			if errors.Is(err, client.ErrNotAuthorizedToPerformOperation) {
 				rw.WriteHeader(http.StatusUnauthorized)

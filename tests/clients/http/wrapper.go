@@ -284,7 +284,8 @@ func (w *Wrapper) NewTxn(readOnly bool) (client.Txn, error) {
 	if err != nil {
 		return nil, err
 	}
-	serverTxn, err := w.handler.Transaction(clientTxn.ID())
+	// Use empty DID for anonymous test context
+	serverTxn, err := w.handler.Transaction("", clientTxn.ID())
 	if err != nil {
 		return nil, err
 	}
@@ -296,7 +297,8 @@ func (w *Wrapper) NewConcurrentTxn(readOnly bool) (client.Txn, error) {
 	if err != nil {
 		return nil, err
 	}
-	serverTxn, err := w.handler.Transaction(clientTxn.ID())
+	// Use empty DID for anonymous test context
+	serverTxn, err := w.handler.Transaction("", clientTxn.ID())
 	if err != nil {
 		return nil, err
 	}

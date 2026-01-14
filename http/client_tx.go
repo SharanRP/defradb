@@ -14,12 +14,13 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/sourcenetwork/immutable"
 	"github.com/sourcenetwork/lens/host-go/config/model"
 
-	"github.com/sourcenetwork/defradb/acp/identity"
+	acpIdentity "github.com/sourcenetwork/defradb/acp/identity"
 	"github.com/sourcenetwork/defradb/client"
 	"github.com/sourcenetwork/defradb/crypto"
 	"github.com/sourcenetwork/defradb/internal/datastore"
@@ -50,24 +51,87 @@ func (txn *Transaction) StartTS() time.Time {
 }
 
 func (txn *Transaction) Commit() error {
+	return txn.CommitContext(context.Background())
+}
+
+// CommitContext commits the transaction with the given context.
+// If the context contains an identity with a private key, the operation is signed.
+func (txn *Transaction) CommitContext(ctx context.Context) error {
 	methodURL := txn.http.apiURL.JoinPath("tx", fmt.Sprintf("%d", txn.id))
 
-	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, methodURL.String(), nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, methodURL.String(), nil)
 	if err != nil {
 		return err
 	}
+
+	// Sign the operation if we have an identity with a private key
+	if err := txn.signRequest(ctx, req, "commit"); err != nil {
+		return err
+	}
+
 	_, err = txn.http.request(req)
 	return err
 }
 
 func (txn *Transaction) Discard() {
+	txn.DiscardContext(context.Background())
+}
+
+// DiscardContext discards the transaction with the given context.
+// If the context contains an identity with a private key, the operation is signed.
+func (txn *Transaction) DiscardContext(ctx context.Context) error {
 	methodURL := txn.http.apiURL.JoinPath("tx", fmt.Sprintf("%d", txn.id))
 
-	req, err := http.NewRequestWithContext(context.Background(), http.MethodDelete, methodURL.String(), nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, methodURL.String(), nil)
 	if err != nil {
-		return
+		return err
 	}
-	txn.http.request(req) //nolint:errcheck
+
+	// Sign the operation if we have an identity with a private key
+	if err := txn.signRequest(ctx, req, "discard"); err != nil {
+		return err
+	}
+
+	_, err = txn.http.request(req)
+	return err
+}
+
+// signRequest adds a transaction operation signature to the request if the context
+// contains an identity with a private key.
+func (txn *Transaction) signRequest(ctx context.Context, req *http.Request, action string) error {
+	identity := acpIdentity.FromContext(ctx)
+	if !identity.HasValue() {
+		return nil // Anonymous user, no signature needed
+	}
+
+	// Check if identity has private key access (FullIdentity)
+	fullIdent, ok := identity.Value().(acpIdentity.FullIdentity)
+	if !ok {
+		// Identity doesn't have private key, cannot sign
+		return nil
+	}
+
+	privKey := fullIdent.PrivateKey()
+	if privKey == nil {
+		return nil
+	}
+
+	// Get the audience (server address)
+	audience := req.Host
+	if audience == "" {
+		audience = txn.http.apiURL.Host
+	}
+
+	// Transaction ID as string for signature
+	txIDStr := strconv.FormatUint(txn.id, 10)
+
+	signature, err := SignTxOperation(privKey, action, txIDStr, audience)
+	if err != nil {
+		return err
+	}
+
+	req.Header.Set(txSignatureHeaderName, signature)
+	return nil
 }
 
 func (txn *Transaction) PrintDump(ctx context.Context) error {
@@ -102,7 +166,7 @@ func (txn *Transaction) DeleteDACActorRelationship(
 	return txn.Client.DeleteDACActorRelationship(ctx, collectionName, docID, relation, targetActor)
 }
 
-func (txn *Transaction) GetNodeIdentity(ctx context.Context) (immutable.Option[identity.PublicRawIdentity], error) {
+func (txn *Transaction) GetNodeIdentity(ctx context.Context) (immutable.Option[acpIdentity.PublicRawIdentity], error) {
 	ctx = datastore.CtxSetFromClientTxn(ctx, txn)
 	return txn.Client.GetNodeIdentity(ctx)
 }
