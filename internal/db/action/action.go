@@ -85,6 +85,9 @@ func Complete(
 		context.TODO(),
 		keys.NewActionStatusKey(collectionID, action).Bytes(),
 	)
+	if err != nil {
+		return err
+	}
 
 	events.Publish(event.NewMessage(event.ActionExecutionName, event.ActionExecution{
 		CollectionID: collectionID,
@@ -92,7 +95,7 @@ func Complete(
 		Status:       client.CompletedActionStatus,
 	}))
 
-	return err
+	return nil
 }
 
 func getStatus(
